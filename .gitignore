@@ -81,6 +81,6 @@ simulation_results.csv
 results/
 !results/README.md
 data/
-
+models/
 
 **/__pycache__/
