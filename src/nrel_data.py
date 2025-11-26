@@ -1,4 +1,5 @@
 import os
+import io
 import requests
 import pandas as pd
 import numpy as np
@@ -16,7 +17,16 @@ class NRELDataLoader:
         cache_path = os.path.join(self.cache_dir, cache_name)
         if os.path.exists(cache_path):
             try:
-                return pd.read_csv(cache_path)
+                # NSRDB CSVs downloaded from the portal include two metadata header rows
+                # (starting with 'Source,'). When present, skip them so that data columns
+                # like 'Year', 'GHI', etc. are parsed correctly.
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    first_line = f.readline()
+                if first_line.startswith('Source,'):
+                    df = pd.read_csv(cache_path, skiprows=2)
+                else:
+                    df = pd.read_csv(cache_path)
+                return df
             except Exception:
                 pass
         try:
@@ -24,7 +34,7 @@ class NRELDataLoader:
             if resp.status_code == 200 and len(resp.text) > 0:
                 lines = resp.text.strip().split('\n')
                 data_lines = lines[2:]
-                df = pd.read_csv(pd.StringIO('\n'.join(data_lines)))
+                df = pd.read_csv(io.StringIO('\n'.join(data_lines)))
                 try:
                     df.to_csv(cache_path, index=False)
                 except Exception:
@@ -37,7 +47,28 @@ class NRELDataLoader:
     def get_solar_data(self, lat: float = 39.7391, lon: float = -104.9847, 
                       year: int = 2022) -> pd.DataFrame:
         try:
-            # Prefer PSM 3.2.2 if available
+            # Try to read cached file first (we have 2020 data)
+            cache_path_2020 = os.path.join(self.cache_dir, f"solar_psm3_legacy_{lat}_{lon}_2020.csv".replace(' ', ''))
+            if os.path.exists(cache_path_2020):
+                try:
+                    df = pd.read_csv(cache_path_2020, skiprows=2)
+                    if 'GHI' in df.columns and len(df) > 8000:
+                        print(f"Using cached REAL solar data from 2020 (closest available to {year})")
+                        return df
+                except Exception:
+                    pass
+            
+            # Try requested year
+            cache_path = os.path.join(self.cache_dir, f"solar_psm3_legacy_{lat}_{lon}_{year}.csv".replace(' ', ''))
+            if os.path.exists(cache_path):
+                try:
+                    df = pd.read_csv(cache_path, skiprows=2)
+                    if 'GHI' in df.columns:
+                        return df
+                except Exception:
+                    pass
+            
+            # Try API
             url = f"{self.base_url}/nsrdb/v2/solar/psm3-2-2-download.csv"
             params = {
                 'api_key': self.api_key,
@@ -57,15 +88,7 @@ class NRELDataLoader:
             )
             if df is not None:
                 return df
-            # fallback to older endpoint
-            url_fallback = f"{self.base_url}/nsrdb/v2/solar/psm3-download.csv"
-            df = self._read_or_cache(
-                cache_name=f"solar_psm3_legacy_{lat}_{lon}_{year}.csv".replace(' ', ''),
-                url=url_fallback,
-                params=params,
-            )
-            if df is not None:
-                return df
+            
             print("NREL Solar API unavailable, using synthetic data")
             return self._generate_synthetic_solar_data()
         except Exception as e:
@@ -108,6 +131,26 @@ class NRELDataLoader:
     def get_wind_data(self, lat: float = 39.7391, lon: float = -104.9847, 
                      year: int = 2022) -> pd.DataFrame:
         try:
+            # Try to read cached file with proper header handling
+            cache_path = os.path.join(self.cache_dir, f"wind_wtk_{lat}_{lon}_{year}.csv".replace(' ', ''))
+            if os.path.exists(cache_path):
+                try:
+                    # Wind files have 2 header rows, skip them and use row 2 as header
+                    df = pd.read_csv(cache_path, skiprows=1, nrows=8760)
+                    # Check if it has the right columns
+                    if 'wind speed at 100m (m/s)' in df.columns or len(df.columns) > 5:
+                        # Rename columns to standard names
+                        if 'wind speed at 100m (m/s)' in df.columns:
+                            df = df.rename(columns={'wind speed at 100m (m/s)': 'Wind Speed'})
+                        else:
+                            # Malformed file, use synthetic
+                            print("NREL Wind cache malformed, using synthetic data")
+                            return self._generate_synthetic_wind_data()
+                        return df
+                except Exception:
+                    pass
+            
+            # Try API
             url = f"{self.base_url}/wind/wtk/v2/download.csv"
             params = {
                 'api_key': self.api_key,

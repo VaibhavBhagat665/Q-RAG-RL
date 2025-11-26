@@ -80,5 +80,7 @@ logs/
 simulation_results.csv
 results/
 !results/README.md
+data/
+
 
 **/__pycache__/

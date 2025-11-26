@@ -1,53 +1,55 @@
+"""
+Main simulation script for Q-RAG-RL system.
+Integrates quantum scenario generation, RAG safety, DRL agent, and digital twin.
+"""
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from src.quantum_module import QuantumScenarioGenerator, ClassicalGAN
-from src.rag_safety import RAGSafetyModule
-from src.drl_agent import DRLAgent, MicrogridEnv
+from src.quantum_scenarios import QuantumScenarioGenerator
+from src.rag_safety import OptimizedRAGSafety
+from src.drl_agent import OptimizedDRLAgent, OptimizedMicrogridEnv
 from src.digital_twin import MicrogridDigitalTwin
 from src.nrel_data import NRELDataLoader
 from src.tariff import TariffModel
 import numpy as np
 import pandas as pd
-from datetime import datetime
 
-def run_complete_simulation(lat: float = 39.7391, lon: float = -104.9847, year: int = 2022, twin_source: str = "case33bw"):
-    print("🔋 Q-RAG-RL Microgrid Management System")
-    print("=" * 50)
+def run_simulation(lat=39.7391, lon=-104.9847, year=2022, 
+                   penalty_sharpness=5.5, margin_tightness=0.88):
+    print("Q-RAG-RL System")
+    print("=" * 60)
     
-    print("1️⃣ Initializing Quantum Scenario Generator...")
-    quantum_gen = QuantumScenarioGenerator(n_qubits=4, n_scenarios=1000)
+    print("1. Quantum Scenario Generator...")
+    quantum_gen = QuantumScenarioGenerator(n_qubits=6, n_scenarios=4000)
     quantum_scenarios = quantum_gen.generate_scenarios()
     print(f"Generated {len(quantum_scenarios)} quantum scenarios")
     
-    print("\n2️⃣ Initializing Classical GAN Baseline...")
-    classical_gan = ClassicalGAN()
-    classical_scenarios = classical_gan.generate_scenarios()
-    print(f"Generated {len(classical_scenarios)} classical scenarios")
+    print("\n2. RAG Safety Module...")
+    print(f"Penalty Sharpness: {penalty_sharpness}")
+    print(f"Margin Tightness: {margin_tightness}")
     
-    print("\n3️⃣ Initializing RAG Safety Module...")
-    rag_safety = RAGSafetyModule()
-    print("Safety constraints loaded into vector database")
+    print("\n3. Digital Twin...")
+    digital_twin = MicrogridDigitalTwin(source="case33bw")
     
-    print("\n4️⃣ Creating Digital Twin (IEEE 33-Bus System)...")
-    digital_twin = MicrogridDigitalTwin(source=twin_source)
-    print("IEEE 33-bus microgrid network created")
-    
-    print("\n5️⃣ Loading NREL Weather Data...")
+    print("\n4. NREL Data...")
     nrel_loader = NRELDataLoader()
     solar_df = nrel_loader.get_solar_data(lat=lat, lon=lon, year=year)
     wind_df = nrel_loader.get_wind_data(lat=lat, lon=lon, year=year)
     solar_power, wind_power = nrel_loader.convert_to_power(solar_df, wind_df)
     load_profile = nrel_loader.get_load_profile()
-    print(f"Loaded {len(solar_power)} hours of renewable generation data")
     
-    print("\n6️⃣ Training DRL Agent with Quantum Scenarios...")
-    drl_agent = DRLAgent(scenarios=quantum_scenarios)
-    model = drl_agent.train(total_timesteps=50000)
-    print("DRL agent training completed")
+    print("\n5. Training DRL Agent...")
+    drl_agent = OptimizedDRLAgent(
+        scenarios=quantum_scenarios,
+        penalty_sharpness=penalty_sharpness,
+        margin_tightness=margin_tightness
+    )
+    model = drl_agent.train(total_timesteps=200000)
+    print("Training completed")
+    print(f"Final Lambda: {drl_agent.cmdp_optimizer.lambda_multiplier:.4f}")
     
-    print("\n7️⃣ Running 24-Hour Simulation...")
+    print("\n6. Running 24-Hour Simulation...")
     results = []
     tariff = TariffModel(lat=lat, lon=lon)
     prices = tariff.get_hourly_prices(hours=24)
@@ -76,7 +78,7 @@ def run_complete_simulation(lat: float = 39.7391, lon: float = -104.9847, year: 
         
         action = drl_agent.predict(obs)[0]
         
-        is_safe, safety_penalty = rag_safety.check_safety(action, current_state)
+        is_safe, safety_penalty = drl_agent.rag_safety.check_safety_graded(action, current_state)
         
         converged, pf_results = digital_twin.simulate_timestep(
             solar_gen_values, wind_gen_values, action
@@ -87,7 +89,7 @@ def run_complete_simulation(lat: float = 39.7391, lon: float = -104.9847, year: 
             cost = grid_power * prices[hour]
         else:
             cost = grid_power * prices[hour] * 0.1
-        # update battery SOC (4 x 15-min timesteps approximated as 1h here)
+        
         battery_soc = float(np.clip(battery_soc - (action * 1.0 / 5.0), 0.0, 1.0))
         
         results.append({
@@ -107,79 +109,28 @@ def run_complete_simulation(lat: float = 39.7391, lon: float = -104.9847, year: 
             'total_losses': pf_results.get('total_losses', 0) if converged else 0
         })
         
-        print(f"Hour {hour:2d}: Cost=${cost:6.2f}, Safe={is_safe}, Action={action:6.3f}MW")
+        print(f"H{hour:2d}: ${cost:6.2f} Safe={is_safe} Act={action:6.3f}MW SOC={battery_soc:.2f}")
     
-    print("\n8️⃣ Simulation Results Summary:")
+    print("\n7. Results:")
     df = pd.DataFrame(results)
     
-    print(f"Total Cost: ${df['cost'].sum():.2f}")
-    print(f"Average Cost: ${df['cost'].mean():.2f}/hour")
-    print(f"Safety Violations: {len(df[df['is_safe'] == False])}/24 hours")
-    print(f"Power Flow Convergence: {len(df[df['converged'] == True])}/24 hours")
-    print(f"Average Battery Action: {df['battery_action'].mean():.3f} MW")
-    print(f"Average Price: ${df['price'].mean():.2f}/kWh")
+    total_cost = df['cost'].sum()
+    violations = len(df[df['is_safe'] == False])
+    
+    print(f"Total Cost: ${total_cost:.2f}")
+    print(f"Safety Violations: {violations}/24")
+    print(f"Avg Battery Action: {df['battery_action'].mean():.3f} MW")
+    print(f"Convergence: {len(df[df['converged'] == True])}/24")
     
     if len(df[df['converged'] == True]) > 0:
         converged_df = df[df['converged'] == True]
         print(f"Min Voltage: {converged_df['min_voltage'].min():.4f} pu")
         print(f"Max Voltage: {converged_df['max_voltage'].max():.4f} pu")
-        print(f"Total Losses: {converged_df['total_losses'].sum():.3f} MW")
     
     df.to_csv('simulation_results.csv', index=False)
-    print("\n✅ Results saved to simulation_results.csv")
+    print("\nSaved to simulation_results.csv")
     
-    return df
-
-def test_individual_components():
-    print("\n🧪 Testing Individual Components:")
-    print("-" * 40)
-    
-    print("Testing Quantum Module...")
-    quantum_gen = QuantumScenarioGenerator(n_qubits=4, n_scenarios=100)
-    quantum_scenarios = quantum_gen.generate_scenarios()
-    print(f"✅ Quantum scenarios shape: {quantum_scenarios.shape}")
-    
-    print("\nTesting RAG Safety...")
-    rag_safety = RAGSafetyModule()
-    test_state = {
-        'battery_soc': 0.5,
-        'voltage': 1.0,
-        'frequency': 50.0,
-        'total_generation': 3.0,
-        'load': 2.5
-    }
-    is_safe, penalty = rag_safety.check_safety(0.5, test_state)
-    print(f"✅ Safety check: Safe={is_safe}, Penalty={penalty}")
-    
-    print("\nTesting Digital Twin...")
-    digital_twin = MicrogridDigitalTwin()
-    converged, results = digital_twin.simulate_timestep([1.0, 1.0, 1.0], [0.8, 0.8], 0.2)
-    print(f"✅ Power flow: Converged={converged}")
-    
-    print("\nTesting DRL Environment...")
-    env = MicrogridEnv(scenarios=quantum_scenarios[:10])
-    obs, _ = env.reset()
-    action = np.array([0.5])
-    next_obs, reward, done, truncated, info = env.step(action)
-    print(f"✅ Environment step: Reward={reward:.3f}, Done={done}")
+    return df, drl_agent
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Q-RAG-RL Microgrid Management System")
-    parser.add_argument("--mode", choices=["full", "test", "dashboard"], default="full",
-                       help="Run mode: full simulation, component tests, or dashboard")
-    parser.add_argument("--lat", type=float, default=39.7391, help="Latitude for NREL data and tariff")
-    parser.add_argument("--lon", type=float, default=-104.9847, help="Longitude for NREL data and tariff")
-    parser.add_argument("--year", type=int, default=2022, help="Year for NREL data")
-    parser.add_argument("--twin", type=str, choices=["custom", "case33bw"], default="case33bw", help="Digital twin source")
-    
-    args = parser.parse_args()
-    
-    if args.mode == "full":
-        run_complete_simulation(lat=args.lat, lon=args.lon, year=args.year, twin_source=args.twin)
-    elif args.mode == "test":
-        test_individual_components()
-    elif args.mode == "dashboard":
-        import subprocess
-        subprocess.run(["streamlit", "run", "src/dashboard.py"])
+    run_simulation()
